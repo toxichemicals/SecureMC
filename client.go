@@ -32,7 +32,7 @@ import (
 	"time"
 )
 
-const currentVersion = "1.3.0"
+const currentVersion = "1.3.1"
 
 type SavedServer struct {
 	Addr string `json:"addr"`
@@ -201,37 +201,55 @@ func executeUpgrade(url string) {
 	os.Exit(0)
 }
 func verifyAndStart(w fyne.Window, target, port string, statusLabel *widget.Label, btn *widget.Button) {
-	conn, err := net.DialTimeout("tcp", target, 3*time.Second)
+	normalizedTarget := formatAddress(target)
+	conn, err := net.DialTimeout("tcp", normalizedTarget, 3*time.Second)
 	if err != nil { statusLabel.SetText("Failed"); return }
 	defer conn.Close(); conn.Write([]byte{0x42, 0x42})
+
 	var pub rsa.PublicKey
 	if err := gob.NewDecoder(conn).Decode(&pub); err != nil { statusLabel.SetText("Handshake Fail"); return }
+
 	fp := fmt.Sprintf("%x", sha256.Sum256(pub.N.Bytes()))
-	knownHosts, _ := os.ReadFile("known_hosts")
-	lines := strings.Split(string(knownHosts), "\n")
+
+	// Read and parse known_hosts strictly
+	data, _ := os.ReadFile("known_hosts")
+	lines := strings.Split(string(data), "\n")
+
 	found := false
 	for _, line := range lines {
-		if strings.HasPrefix(line, target+":") {
+		line = strings.TrimSpace(line)
+		if line == "" { continue }
+
+		parts := strings.Split(line, ":")
+		if len(parts) < 2 { continue }
+
+		// Reconstruct the key to match exactly
+		hostKey := strings.Join(parts[:len(parts)-1], ":")
+		storedFp := parts[len(parts)-1]
+
+		if hostKey == normalizedTarget {
 			found = true
-			storedFp := strings.Split(line, ":")[1]
 			if storedFp != fp {
-				dialog.ShowError(fmt.Errorf("MITM Alert!: Server identity changed."), w)
+				dialog.ShowError(fmt.Errorf("SECURITY ALERT: Server identity mismatch!"), w)
 				statusLabel.SetText("MITM Blocked")
 				return
 			}
+			break
 		}
 	}
+
 	if found {
-		startProxy(target, port, statusLabel, btn)
+		startProxy(normalizedTarget, port, statusLabel, btn)
 	} else {
 		dialog.ShowConfirm("Identity", "Trust new fingerprint?\n"+fp, func(ok bool) {
 			if ok {
 				f, _ := os.OpenFile("known_hosts", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-				f.WriteString(target + ":" + fp + "\n"); f.Close(); startProxy(target, port, statusLabel, btn)
+				f.WriteString(normalizedTarget + ":" + fp + "\n"); f.Close(); startProxy(normalizedTarget, port, statusLabel, btn)
 			}
 		}, w)
 	}
 }
+
 func startProxy(target, port string, statusLabel *widget.Label, btn *widget.Button) {
 	ctx, cancel := context.WithCancel(context.Background())
 	currentCancel = cancel
