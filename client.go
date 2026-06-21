@@ -7,6 +7,8 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/gob"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -30,19 +32,28 @@ import (
 	"time"
 )
 
-const currentVersion = "1.1.1"
+const currentVersion = "1.2.0"
+
+type SavedServer struct {
+	Addr string `json:"addr"`
+	Port string `json:"port"`
+}
 
 var (
 	currentCancel context.CancelFunc
 	updateBinding = binding.NewFloat()
+	savedList     []SavedServer
 )
 
 func main() {
+	noUpdate := flag.Bool("nu", false, "Disable auto-updates")
+	flag.Parse()
+
+	loadServers()
 	a := app.New()
 	w := a.NewWindow("SecureMC Proxy")
-	w.Resize(fyne.NewSize(450, 500))
+	w.Resize(fyne.NewSize(450, 650))
 
-	// Generate and set application icon
 	iconColor := color.NRGBA{R: 6, G: 64, B: 43, A: 255}
 	iconImg := image.NewNRGBA(image.Rect(0, 0, 64, 64))
 	draw.Draw(iconImg, iconImg.Bounds(), &image.Uniform{iconColor}, image.Point{}, draw.Src)
@@ -51,10 +62,9 @@ func main() {
 	a.SetIcon(fyne.NewStaticResource("icon.png", buf.Bytes()))
 
 	if desk, ok := a.(desktop.App); ok {
-		desk.SetSystemTrayMenu(fyne.NewMenu("SecureMC Context Menu",
+		desk.SetSystemTrayMenu(fyne.NewMenu("SecureMC",
 			fyne.NewMenuItem("SecureMC", w.Show),
 			fyne.NewMenuItemSeparator(),
-			fyne.NewMenuItem("Show", w.Show),
 			fyne.NewMenuItem("Quit", a.Quit),
 		))
 	}
@@ -62,14 +72,38 @@ func main() {
 	w.SetCloseIntercept(w.Hide)
 
 	targetEntry := widget.NewEntry()
-	targetEntry.SetText("127.0.0.1:25566")
 	localEntry := widget.NewEntry()
-	localEntry.SetText("25565")
 	statusLabel := widget.NewLabel("Ready")
-
 	btn := widget.NewButton("Start Proxy", nil)
+
+	list := widget.NewList(
+		func() int { return len(savedList) },
+		func() fyne.CanvasObject {
+			addr := widget.NewLabel("")
+			removeBtn := widget.NewButton("X", nil)
+			return container.NewBorder(nil, nil, nil, removeBtn, addr)
+		},
+		func(id widget.ListItemID, obj fyne.CanvasObject) {
+			o := obj.(*fyne.Container)
+			lbl := o.Objects[0].(*widget.Label)
+			removeBtn := o.Objects[1].(*widget.Button)
+			lbl.SetText(savedList[id].Addr + " -> " + savedList[id].Port)
+			removeBtn.OnTapped = func() {
+				savedList = append(savedList[:id], savedList[id+1:]...)
+				saveServers()
+				w.Content().Refresh()
+			}
+		},
+	)
+	list.OnSelected = func(id widget.ListItemID) {
+		targetEntry.SetText(savedList[id].Addr)
+		localEntry.SetText(savedList[id].Port)
+	}
+
 	btn.OnTapped = func() {
 		if btn.Text == "Start Proxy" {
+			addServer(targetEntry.Text, localEntry.Text)
+			w.Content().Refresh()
 			verifyAndStart(w, targetEntry.Text, localEntry.Text, statusLabel, btn)
 		} else if currentCancel != nil {
 			currentCancel()
@@ -79,7 +113,7 @@ func main() {
 	}
 
 	instrBtn := widget.NewButton("Instructions", func() {
-		dialog.ShowInformation("How to use", "1. Type server address\n2. Type local port\n3. Start Proxy", w)
+		dialog.ShowInformation("How to use", "1. Type server address\n2. Type local port\n3. Start Proxy\n4. Connect to localhost:[port]", w)
 	})
 
 	resetBtn := widget.NewButton("Reset Host Fingerprints", func() {
@@ -89,18 +123,35 @@ func main() {
 	})
 
 	w.SetContent(container.NewScroll(container.NewVBox(
-		widget.NewLabel("Proxy Server Address:"), targetEntry,
-		widget.NewLabel("Local Minecraft Port:"), localEntry,
+		widget.NewLabel("Server Address:"), targetEntry,
+		widget.NewLabel("Local Port:"), localEntry,
 		container.NewPadded(btn),
 		container.NewPadded(instrBtn),
 		container.NewPadded(resetBtn),
-		statusLabel,
+		widget.NewLabel("History:"), list, statusLabel,
 	)))
 
-	if runtime.GOOS == "windows" { ensureBatchFile() }
-	go checkForUpdates(w)
-
+	if !*noUpdate {
+		if runtime.GOOS == "windows" { ensureBatchFile() }
+		go checkForUpdates(w)
+	}
 	w.ShowAndRun()
+}
+
+func loadServers() {
+	data, _ := os.ReadFile("saved_servers.json")
+	json.Unmarshal(data, &savedList)
+}
+
+func saveServers() {
+	data, _ := json.Marshal(savedList)
+	os.WriteFile("saved_servers.json", data, 0644)
+}
+
+func addServer(addr, port string) {
+	for _, s := range savedList { if s.Addr == addr && s.Port == port { return } }
+	savedList = append(savedList, SavedServer{Addr: addr, Port: port})
+	saveServers()
 }
 
 func ensureBatchFile() {
@@ -117,15 +168,13 @@ func checkForUpdates(w fyne.Window) {
 	if err != nil { return }
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
-
 	lines := strings.Split(string(data), "\n")
 	if len(lines) == 0 || strings.TrimSpace(lines[0]) == currentVersion { return }
-
 	for _, line := range lines[1:] {
 		if strings.HasPrefix(line, runtime.GOOS+":") {
 			path := strings.TrimSpace(strings.Split(line, ": ")[1])
 			progress := widget.NewProgressBarWithData(updateBinding)
-			w.SetContent(container.NewVBox(widget.NewLabel("Downloading Update..."), progress))
+			w.SetContent(container.NewVBox(widget.NewLabel("Updating..."), progress))
 			executeUpgrade(path)
 		}
 	}
@@ -134,42 +183,31 @@ func checkForUpdates(w fyne.Window) {
 func executeUpgrade(url string) {
 	resp, _ := http.Get("https://github.com/toxichemicals/SecureMC/raw/main/" + url)
 	defer resp.Body.Close()
-
 	total, _ := strconv.ParseFloat(resp.Header.Get("Content-Length"), 64)
 	exePath, _ := os.Executable()
 	newPath := exePath + ".new"
 	out, _ := os.Create(newPath)
-
 	buf := make([]byte, 32*1024)
 	var downloaded float64
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
-			out.Write(buf[:n])
-			downloaded += float64(n)
+			out.Write(buf[:n]); downloaded += float64(n)
 			updateBinding.Set(downloaded / total)
 		}
 		if err == io.EOF { break }
 	}
-	out.Close()
-	os.Chmod(newPath, 0755)
-
-	if runtime.GOOS == "windows" {
-		exec.Command("cmd", "/c", "update.bat", exePath, newPath).Start()
-	} else {
-		os.Rename(newPath, exePath)
-		exec.Command(exePath).Start()
-	}
+	out.Close(); os.Chmod(newPath, 0755)
+	if runtime.GOOS == "windows" { exec.Command("cmd", "/c", "update.bat", exePath, newPath).Start() } else { os.Rename(newPath, exePath); exec.Command(exePath).Start() }
 	os.Exit(0)
 }
 
 func verifyAndStart(w fyne.Window, target, port string, statusLabel *widget.Label, btn *widget.Button) {
 	conn, err := net.DialTimeout("tcp", target, 3*time.Second)
 	if err != nil { statusLabel.SetText("Failed"); return }
-	defer conn.Close()
-	conn.Write([]byte{0x42, 0x42})
+	defer conn.Close(); conn.Write([]byte{0x42, 0x42})
 	var pub rsa.PublicKey
-	if err := gob.NewDecoder(conn).Decode(&pub); err != nil { statusLabel.SetText("Handshake Failed"); return }
+	if err := gob.NewDecoder(conn).Decode(&pub); err != nil { statusLabel.SetText("Handshake Fail"); return }
 	fp := fmt.Sprintf("%x", sha256.Sum256(pub.N.Bytes()))
 	knownHosts, _ := os.ReadFile("known_hosts")
 	if strings.Contains(string(knownHosts), target+":"+fp) { startProxy(target, port, statusLabel, btn); return }
@@ -197,17 +235,13 @@ func runProxyServer(ctx context.Context, target, listen string, statusLabel *wid
 		c, err := ln.Accept()
 		if err != nil { return }
 		go func(conn net.Conn) {
-			defer conn.Close()
-			p, err := net.Dial("tcp", target)
+			defer conn.Close(); p, err := net.Dial("tcp", target)
 			if err != nil { return }
-			defer p.Close()
-			p.Write([]byte{0x42, 0x42})
-			var pub rsa.PublicKey
-			gob.NewDecoder(p).Decode(&pub)
+			defer p.Close(); p.Write([]byte{0x42, 0x42})
+			var pub rsa.PublicKey; gob.NewDecoder(p).Decode(&pub)
 			secret := make([]byte, 32); rand.Read(secret)
 			enc, _ := rsa.EncryptOAEP(sha256.New(), rand.Reader, &pub, secret, nil)
-			p.Write(enc)
-			go io.Copy(p, conn); io.Copy(conn, p)
+			p.Write(enc); go io.Copy(p, conn); io.Copy(conn, p)
 		}(c)
 	}
 }
