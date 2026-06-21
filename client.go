@@ -32,7 +32,7 @@ import (
 	"time"
 )
 
-const currentVersion = "1.2.0"
+const currentVersion = "1.3.0"
 
 type SavedServer struct {
 	Addr string `json:"addr"`
@@ -44,6 +44,11 @@ var (
 	updateBinding = binding.NewFloat()
 	savedList     []SavedServer
 )
+
+func formatAddress(addr string) string {
+	if !strings.Contains(addr, ":") { return addr + ":25565" }
+	return addr
+}
 
 func main() {
 	noUpdate := flag.Bool("nu", false, "Disable auto-updates")
@@ -102,9 +107,10 @@ func main() {
 
 	btn.OnTapped = func() {
 		if btn.Text == "Start Proxy" {
-			addServer(targetEntry.Text, localEntry.Text)
+			addr := formatAddress(targetEntry.Text)
+			addServer(addr, localEntry.Text)
 			w.Content().Refresh()
-			verifyAndStart(w, targetEntry.Text, localEntry.Text, statusLabel, btn)
+			verifyAndStart(w, addr, localEntry.Text, statusLabel, btn)
 		} else if currentCancel != nil {
 			currentCancel()
 			btn.SetText("Start Proxy")
@@ -122,15 +128,20 @@ func main() {
 		}, w)
 	})
 
-	w.SetContent(container.NewScroll(container.NewVBox(
-		widget.NewLabel("Server Address:"), targetEntry,
-		widget.NewLabel("Local Port:"), localEntry,
-		container.NewPadded(btn),
-		container.NewPadded(instrBtn),
-		container.NewPadded(resetBtn),
-		widget.NewLabel("History:"), list, statusLabel,
-	)))
+	content := container.NewBorder(
+		container.NewVBox(
+			widget.NewLabel("Server Address:"), targetEntry,
+			widget.NewLabel("Local Port:"), localEntry,
+			container.NewPadded(btn),
+			container.NewPadded(instrBtn),
+			container.NewPadded(resetBtn),
+			widget.NewLabel("History:"),
+		),
+		statusLabel, nil, nil,
+		list,
+	)
 
+	w.SetContent(content)
 	if !*noUpdate {
 		if runtime.GOOS == "windows" { ensureBatchFile() }
 		go checkForUpdates(w)
@@ -138,22 +149,12 @@ func main() {
 	w.ShowAndRun()
 }
 
-func loadServers() {
-	data, _ := os.ReadFile("saved_servers.json")
-	json.Unmarshal(data, &savedList)
-}
-
-func saveServers() {
-	data, _ := json.Marshal(savedList)
-	os.WriteFile("saved_servers.json", data, 0644)
-}
-
+func loadServers() { data, _ := os.ReadFile("saved_servers.json"); json.Unmarshal(data, &savedList) }
+func saveServers() { data, _ := json.Marshal(savedList); os.WriteFile("saved_servers.json", data, 0644) }
 func addServer(addr, port string) {
 	for _, s := range savedList { if s.Addr == addr && s.Port == port { return } }
-	savedList = append(savedList, SavedServer{Addr: addr, Port: port})
-	saveServers()
+	savedList = append(savedList, SavedServer{Addr: addr, Port: port}); saveServers()
 }
-
 func ensureBatchFile() {
 	batch := `@echo off
 timeout /t 2 /nobreak >nul
@@ -162,7 +163,6 @@ move "%~2" "%~1"
 start "" "%~1"`
 	os.WriteFile("update.bat", []byte(batch), 0755)
 }
-
 func checkForUpdates(w fyne.Window) {
 	resp, err := http.Get("https://raw.githubusercontent.com/toxichemicals/SecureMC/main/latver.txt")
 	if err != nil { return }
@@ -179,7 +179,6 @@ func checkForUpdates(w fyne.Window) {
 		}
 	}
 }
-
 func executeUpgrade(url string) {
 	resp, _ := http.Get("https://github.com/toxichemicals/SecureMC/raw/main/" + url)
 	defer resp.Body.Close()
@@ -201,7 +200,6 @@ func executeUpgrade(url string) {
 	if runtime.GOOS == "windows" { exec.Command("cmd", "/c", "update.bat", exePath, newPath).Start() } else { os.Rename(newPath, exePath); exec.Command(exePath).Start() }
 	os.Exit(0)
 }
-
 func verifyAndStart(w fyne.Window, target, port string, statusLabel *widget.Label, btn *widget.Button) {
 	conn, err := net.DialTimeout("tcp", target, 3*time.Second)
 	if err != nil { statusLabel.SetText("Failed"); return }
@@ -210,22 +208,36 @@ func verifyAndStart(w fyne.Window, target, port string, statusLabel *widget.Labe
 	if err := gob.NewDecoder(conn).Decode(&pub); err != nil { statusLabel.SetText("Handshake Fail"); return }
 	fp := fmt.Sprintf("%x", sha256.Sum256(pub.N.Bytes()))
 	knownHosts, _ := os.ReadFile("known_hosts")
-	if strings.Contains(string(knownHosts), target+":"+fp) { startProxy(target, port, statusLabel, btn); return }
-	dialog.ShowConfirm("Identity", "Trust fingerprint?\n"+fp, func(ok bool) {
-		if ok {
-			f, _ := os.OpenFile("known_hosts", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			f.WriteString(target + ":" + fp + "\n"); f.Close(); startProxy(target, port, statusLabel, btn)
+	lines := strings.Split(string(knownHosts), "\n")
+	found := false
+	for _, line := range lines {
+		if strings.HasPrefix(line, target+":") {
+			found = true
+			storedFp := strings.Split(line, ":")[1]
+			if storedFp != fp {
+				dialog.ShowError(fmt.Errorf("MITM Alert!: Server identity changed."), w)
+				statusLabel.SetText("MITM Blocked")
+				return
+			}
 		}
-	}, w)
+	}
+	if found {
+		startProxy(target, port, statusLabel, btn)
+	} else {
+		dialog.ShowConfirm("Identity", "Trust new fingerprint?\n"+fp, func(ok bool) {
+			if ok {
+				f, _ := os.OpenFile("known_hosts", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				f.WriteString(target + ":" + fp + "\n"); f.Close(); startProxy(target, port, statusLabel, btn)
+			}
+		}, w)
+	}
 }
-
 func startProxy(target, port string, statusLabel *widget.Label, btn *widget.Button) {
 	ctx, cancel := context.WithCancel(context.Background())
 	currentCancel = cancel
 	go runProxyServer(ctx, target, port, statusLabel)
 	btn.SetText("Stop Proxy")
 }
-
 func runProxyServer(ctx context.Context, target, listen string, statusLabel *widget.Label) {
 	ln, err := net.Listen("tcp", ":"+listen)
 	if err != nil { statusLabel.SetText("Listen Err"); return }
