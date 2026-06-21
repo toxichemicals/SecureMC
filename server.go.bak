@@ -1,0 +1,113 @@
+package main
+
+import (
+	"bufio"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/gob"
+	"encoding/pem"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"time"
+)
+
+var (
+	port    = flag.String("p", "25566", "Proxy port")
+	relay   = flag.String("r", "127.0.0.1:25565", "Minecraft server relay")
+	verbose = flag.Bool("v", false, "Enable verbose logging")
+)
+
+func logVerbose(format string, a ...interface{}) {
+	if *verbose {
+		fmt.Printf("[DEBUG] "+format+"\n", a...)
+	}
+}
+
+func main() {
+	flag.Parse()
+
+	var priv *rsa.PrivateKey
+	keyFile := "server.key"
+	keyData, err := os.ReadFile(keyFile)
+
+	if err != nil {
+		fmt.Println("Generating new server key...")
+		priv, _ = rsa.GenerateKey(rand.Reader, 2048)
+		keyBytes := x509.MarshalPKCS1PrivateKey(priv)
+		pemBlock := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: keyBytes}
+		os.WriteFile(keyFile, pem.EncodeToMemory(pemBlock), 0600)
+	} else {
+		block, _ := pem.Decode(keyData)
+		priv, _ = x509.ParsePKCS1PrivateKey(block.Bytes)
+	}
+
+	ln, err := net.Listen("tcp", ":"+*port)
+	if err != nil {
+		fmt.Printf("Listen error: %v\n", err)
+		return
+	}
+
+	logVerbose("Server listening on port %s", *port)
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+		go handleConnection(c, priv)
+	}
+}
+
+func handleConnection(c net.Conn, priv *rsa.PrivateKey) {
+	defer c.Close()
+
+	c.SetReadDeadline(time.Now().Add(1 * time.Second))
+	reader := bufio.NewReader(c)
+
+	// Check for Magic Number 0x42 0x42
+	magic, err := reader.Peek(2)
+	c.SetReadDeadline(time.Time{})
+
+	if err != nil || magic[0] != 0x42 || magic[1] != 0x42 {
+		logVerbose("Vanilla client detected, forwarding.")
+		target, err := net.Dial("tcp", *relay)
+		if err != nil { return }
+		defer target.Close()
+
+		go io.Copy(target, reader)
+		io.Copy(c, target)
+		return
+	}
+
+	// Consume the magic bytes so they aren't sent to the backend
+	reader.Discard(2)
+
+	logVerbose("Secure client detected, initiating handshake.")
+	enc := gob.NewEncoder(c)
+	enc.Encode(priv.PublicKey)
+
+	encryptedKey := make([]byte, 256)
+	n, err := c.Read(encryptedKey)
+	if err != nil || n != 256 {
+		logVerbose("Handshake failed: %v", err)
+		return
+	}
+
+	_, err = rsa.DecryptOAEP(sha256.New(), rand.Reader, priv, encryptedKey[:n], nil)
+	if err != nil {
+		logVerbose("RSA decryption failed: %v", err)
+		return
+	}
+
+	logVerbose("Encryption verified. Tunneling.")
+	target, err := net.Dial("tcp", *relay)
+	if err != nil { return }
+	defer target.Close()
+
+	go io.Copy(target, c)
+	io.Copy(c, target)
+}

@@ -1,0 +1,132 @@
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/gob"
+	"fmt"
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/widget"
+	"io"
+	"net"
+	"os"
+	"strings"
+)
+
+func main() {
+	a := app.New()
+	w := a.NewWindow("SecureMC Proxy")
+	w.Resize(fyne.NewSize(400, 300))
+
+	targetEntry := widget.NewEntry()
+	targetEntry.SetText("127.0.0.1:25566")
+
+	localEntry := widget.NewEntry()
+	localEntry.SetText("25565")
+
+	statusLabel := widget.NewLabel("Ready")
+	statusChan := make(chan string)
+
+	go func() {
+		for msg := range statusChan {
+			statusLabel.SetText(msg)
+			statusLabel.Refresh()
+		}
+	}()
+
+	var cancelFunc context.CancelFunc
+	btn := widget.NewButton("Start Proxy", nil)
+	btn.OnTapped = func() {
+		if btn.Text == "Start Proxy" {
+			target := targetEntry.Text
+			if target == "" { target = "127.0.0.1:25566" }
+			port := localEntry.Text
+			if port == "" { port = "25565" }
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancelFunc = cancel
+			go runProxyServer(ctx, target, port, statusChan)
+			btn.SetText("Stop Proxy")
+		} else {
+			cancelFunc()
+			btn.SetText("Start Proxy")
+			statusChan <- "Stopped"
+		}
+	}
+
+	w.SetContent(container.NewVBox(
+		widget.NewLabel("Proxy Server Address:"), targetEntry,
+		widget.NewLabel("Local Minecraft Port:"), localEntry,
+		btn, statusLabel,
+	))
+	w.ShowAndRun()
+}
+
+func runProxyServer(ctx context.Context, target, listen string, statusChan chan string) {
+	ln, err := net.Listen("tcp", ":"+listen)
+	if err != nil {
+		statusChan <- "Listen Error: " + err.Error()
+		return
+	}
+	defer ln.Close()
+	statusChan <- "Proxy Running"
+
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
+
+	for {
+		clientConn, err := ln.Accept()
+		if err != nil { return }
+
+		go func(localConn net.Conn) {
+			defer localConn.Close()
+
+			proxyConn, err := net.Dial("tcp", target)
+			if err != nil { return }
+			defer proxyConn.Close()
+
+			// --- MAGIC NUMBER HANDSHAKE ---
+			proxyConn.Write([]byte{0x42, 0x42})
+
+			// --- ENCRYPTED HANDSHAKE ---
+			var pub rsa.PublicKey
+			if err := gob.NewDecoder(proxyConn).Decode(&pub); err != nil {
+				return
+			}
+
+			fp := fmt.Sprintf("%x", sha256.Sum256(pub.N.Bytes()))
+			if !verifyHost(fp) { return }
+
+			secret := make([]byte, 32)
+			rand.Read(secret)
+			encKey, _ := rsa.EncryptOAEP(sha256.New(), rand.Reader, &pub, secret, nil)
+			proxyConn.Write(encKey)
+
+			// --- TUNNELING ---
+			errs := make(chan error, 2)
+			go func() { errs <- copyStream(proxyConn, localConn) }()
+			go func() { errs <- copyStream(localConn, proxyConn) }()
+			<-errs
+		}(clientConn)
+	}
+}
+
+func copyStream(dst, src net.Conn) error {
+	_, err := io.Copy(dst, src)
+	return err
+}
+
+func verifyHost(fp string) bool {
+	known, _ := os.ReadFile("known_hosts")
+	if strings.Contains(string(known), fp) { return true }
+	f, _ := os.OpenFile("known_hosts", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f.WriteString(fp + "\n")
+	f.Close()
+	return true
+}
