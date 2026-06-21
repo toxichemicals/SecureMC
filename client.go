@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -11,7 +12,12 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/widget"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/png"
 	"io"
 	"net"
 	"os"
@@ -25,6 +31,30 @@ func main() {
 	a := app.New()
 	w := a.NewWindow("SecureMC Proxy")
 	w.Resize(fyne.NewSize(450, 500))
+
+	// Generate and set application icon (#06402B)
+	iconColor := color.NRGBA{R: 6, G: 64, B: 43, A: 255}
+	iconImg := image.NewNRGBA(image.Rect(0, 0, 64, 64))
+	draw.Draw(iconImg, iconImg.Bounds(), &image.Uniform{iconColor}, image.Point{}, draw.Src)
+	var buf bytes.Buffer
+	png.Encode(&buf, iconImg)
+	a.SetIcon(fyne.NewStaticResource("icon.png", buf.Bytes()))
+
+	// System Tray Setup
+	if desk, ok := a.(desktop.App); ok {
+		m := fyne.NewMenu("SecureMC Context Menu",
+			fyne.NewMenuItem("SecureMC", func() { w.Show() }),
+			fyne.NewMenuItemSeparator(),
+			fyne.NewMenuItem("Show", func() { w.Show() }),
+			fyne.NewMenuItem("Quit", func() { a.Quit() }),
+		)
+		desk.SetSystemTrayMenu(m)
+	}
+
+	// Intercept close to minimize to tray
+	w.SetCloseIntercept(func() {
+		w.Hide()
+	})
 
 	targetEntry := widget.NewEntry()
 	targetEntry.SetText("127.0.0.1:25566")
