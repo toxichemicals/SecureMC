@@ -1,6 +1,6 @@
 # SecureMC Proxy
 
-SecureMC is a lightweight, cross-platform security proxy designed to prevent Man-in-the-Middle (MITM) attacks on Minecraft servers by implementing a custom cryptographic handshake.
+SecureMC is a lightweight, cross-platform security proxy designed to prevent Man-in-the-Middle (MITM) attacks on offline-mode Minecraft servers by implementing a custom cryptographic handshake.
 
 ## Getting Started
 
