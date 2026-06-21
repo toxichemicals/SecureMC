@@ -20,19 +20,26 @@ import (
 	"image/png"
 	"io"
 	"net"
+	"net/http"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 )
 
+const currentVersion = "1.0.0"
+
 var currentCancel context.CancelFunc
 
 func main() {
+	ensureBatchFile()
+	go checkForUpdates()
+
 	a := app.New()
 	w := a.NewWindow("SecureMC Proxy")
 	w.Resize(fyne.NewSize(450, 500))
 
-	// Generate and set application icon (#06402B)
 	iconColor := color.NRGBA{R: 6, G: 64, B: 43, A: 255}
 	iconImg := image.NewNRGBA(image.Rect(0, 0, 64, 64))
 	draw.Draw(iconImg, iconImg.Bounds(), &image.Uniform{iconColor}, image.Point{}, draw.Src)
@@ -40,29 +47,31 @@ func main() {
 	png.Encode(&buf, iconImg)
 	a.SetIcon(fyne.NewStaticResource("icon.png", buf.Bytes()))
 
-	// System Tray Setup
 	if desk, ok := a.(desktop.App); ok {
-		m := fyne.NewMenu("SecureMC Context Menu",
-			fyne.NewMenuItem("SecureMC", func() { w.Show() }),
+		desk.SetSystemTrayMenu(fyne.NewMenu("SecureMC Context Menu",
+			fyne.NewMenuItem("SecureMC", w.Show),
 			fyne.NewMenuItemSeparator(),
-			fyne.NewMenuItem("Show", func() { w.Show() }),
-			fyne.NewMenuItem("Quit", func() { a.Quit() }),
-		)
-		desk.SetSystemTrayMenu(m)
+			fyne.NewMenuItem("Show", w.Show),
+			fyne.NewMenuItem("Quit", a.Quit),
+		))
 	}
 
-	// Intercept close to minimize to tray
-	w.SetCloseIntercept(func() {
-		w.Hide()
-	})
+	w.SetCloseIntercept(w.Hide)
 
 	targetEntry := widget.NewEntry()
 	targetEntry.SetText("127.0.0.1:25566")
 	localEntry := widget.NewEntry()
 	localEntry.SetText("25565")
-
 	statusLabel := widget.NewLabel("Ready")
 	statusLabel.Wrapping = fyne.TextWrapWord
+
+	instrBtn := widget.NewButton("Instructions", func() {
+		dialog.ShowInformation("How to use SecureMC",
+			"1. Type in server address (e.g. toxichemicals.loseyourip.com:25565)\n"+
+				"2. Type in local port (e.g. 25565)\n"+
+				"3. Click 'Start Proxy'\n"+
+				"4. Connect in-game at localhost:[local port] (e.g. localhost:25565)", w)
+	})
 
 	btn := widget.NewButton("Start Proxy", nil)
 	btn.OnTapped = func() {
@@ -84,17 +93,61 @@ func main() {
 		}, w)
 	})
 
-	content := container.NewVBox(
+	w.SetContent(container.NewScroll(container.NewVBox(
 		widget.NewLabel("Proxy Server Address:"), targetEntry,
 		widget.NewLabel("Local Minecraft Port:"), localEntry,
 		container.NewPadded(btn),
+		container.NewPadded(instrBtn),
 		container.NewPadded(resetBtn),
 		widget.NewSeparator(),
 		statusLabel,
-	)
+	)))
 
-	w.SetContent(container.NewScroll(content))
 	w.ShowAndRun()
+}
+
+func ensureBatchFile() {
+	batch := `@echo off
+timeout /t 2 /nobreak >nul
+del "%~1"
+move "%~2" "%~1"
+start "" "%~1"`
+	if _, err := os.Stat("update.bat"); os.IsNotExist(err) {
+		os.WriteFile("update.bat", []byte(batch), 0755)
+	}
+}
+
+func checkForUpdates() {
+	resp, err := http.Get("https://raw.githubusercontent.com/toxichemicals/SecureMC/main/latver.txt")
+	if err != nil { return }
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+
+	lines := strings.Split(string(data), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == currentVersion { return }
+
+	for _, line := range lines[1:] {
+		if strings.Contains(line, runtime.GOOS) {
+			path := strings.TrimSpace(strings.Split(line, ": ")[1])
+			executeUpgrade(path)
+		}
+	}
+}
+
+func executeUpgrade(url string) {
+	resp, err := http.Get("https://github.com/toxichemicals/SecureMC/raw/main/" + url)
+	if err != nil { return }
+	defer resp.Body.Close()
+
+	newPath := "SecureMC_update.exe"
+	out, _ := os.Create(newPath)
+	io.Copy(out, resp.Body)
+	out.Close()
+
+	exePath, _ := os.Executable()
+	cmd := exec.Command("cmd", "/c", "update.bat", exePath, newPath)
+	cmd.Start()
+	os.Exit(0)
 }
 
 func verifyAndStart(w fyne.Window, target, port string, statusLabel *widget.Label, btn *widget.Button) {
@@ -104,38 +157,25 @@ func verifyAndStart(w fyne.Window, target, port string, statusLabel *widget.Labe
 		return
 	}
 	defer conn.Close()
-
 	conn.Write([]byte{0x42, 0x42})
 	var pub rsa.PublicKey
 	if err := gob.NewDecoder(conn).Decode(&pub); err != nil {
 		statusLabel.SetText("Handshake failed")
 		return
 	}
-
 	fp := fmt.Sprintf("%x", sha256.Sum256(pub.N.Bytes()))
 	knownHosts, _ := os.ReadFile("known_hosts")
-	knownHostsStr := string(knownHosts)
-
-	if strings.Contains(knownHostsStr, target+":"+fp) {
+	if strings.Contains(string(knownHosts), target+":"+fp) {
 		startProxy(target, port, statusLabel, btn)
 		return
 	}
-
-	if strings.Contains(knownHostsStr, target+":") {
-		d := dialog.NewCustomConfirm("CRITICAL SECURITY ALERT", "Continue Anyway (Dangerous)", "Cancel",
-			container.NewVBox(
-				widget.NewLabel("Fingerprint mismatch for "+target+"!"),
-				widget.NewLabel("What is an MITM attack?"),
-				widget.NewRichTextFromMarkdown("An attacker intercepts your connection by presenting a fake identity. "+
-					"This allows them to decrypt or modify your traffic."),
-			),
-			func(ok bool) {
-				if ok { startProxy(target, port, statusLabel, btn) }
-			}, w)
+	if strings.Contains(string(knownHosts), target+":") {
+		d := dialog.NewCustomConfirm("SECURITY ALERT", "Continue Anyway", "Cancel",
+			widget.NewLabel("Fingerprint mismatch for "+target+"!"),
+			func(ok bool) { if ok { startProxy(target, port, statusLabel, btn) } }, w)
 		d.Show()
 		return
 	}
-
 	dialog.ShowConfirm("New Host Identity", "Trust new server fingerprint?\n"+fp, func(ok bool) {
 		if ok {
 			f, _ := os.OpenFile("known_hosts", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -159,39 +199,23 @@ func runProxyServer(ctx context.Context, target, listen string, statusLabel *wid
 		statusLabel.SetText("Listen Error: " + err.Error())
 		return
 	}
-
-	go func() {
-		<-ctx.Done()
-		ln.Close()
-	}()
-
+	go func() { <-ctx.Done(); ln.Close() }()
 	statusLabel.SetText("Proxy Running")
 	for {
 		clientConn, err := ln.Accept()
-		if err != nil {
-			return
-		}
+		if err != nil { return }
 		go func(c net.Conn) {
 			defer c.Close()
 			p, err := net.Dial("tcp", target)
-			if err != nil {
-				return
-			}
+			if err != nil { return }
 			defer p.Close()
-
-			// Secure Handshake Protocol
 			p.Write([]byte{0x42, 0x42})
 			var pub rsa.PublicKey
-			if err := gob.NewDecoder(p).Decode(&pub); err != nil {
-				return
-			}
-
+			if err := gob.NewDecoder(p).Decode(&pub); err != nil { return }
 			secret := make([]byte, 32)
 			rand.Read(secret)
 			encrypted, _ := rsa.EncryptOAEP(sha256.New(), rand.Reader, &pub, secret, nil)
 			p.Write(encrypted)
-
-			// Tunneling
 			go io.Copy(p, c)
 			io.Copy(c, p)
 		}(clientConn)
