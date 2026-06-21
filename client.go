@@ -28,7 +28,7 @@ import (
 	"time"
 )
 
-const currentVersion = "1.0.0"
+const currentVersion = "1.1.0"
 
 var currentCancel context.CancelFunc
 
