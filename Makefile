@@ -1,7 +1,7 @@
 # Output directories
 SBUILD_DIR := sbuild
 CBUILD_DIR := cbuild
-CLIENTNAME := SecureMCv1.1.0
+CLIENTNAME := SecureMC
 # Server builds
 server:
 	@mkdir -p $(SBUILD_DIR)
