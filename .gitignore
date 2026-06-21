@@ -1,0 +1,11 @@
+# Security-sensitive or temporary files
+known_hosts
+server.key
+.fingerprint
+# System/OS files
+.DS_Store
+Thumbs.db
+
+# IDE/Editor folders
+.vscode/
+.idea/
