@@ -32,10 +32,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
+	"sync"
 )
 
-const currentVersion = "1.4.0"
+const currentVersion = "1.4.1"
 
 type SavedServer struct {
 	Addr string `json:"addr"`
@@ -46,6 +46,7 @@ var (
 	currentCancel context.CancelFunc
 	updateBinding = binding.NewFloat()
 	savedList     []SavedServer
+	verbose				*bool
 )
 
 func formatAddress(addr string) string {
@@ -55,6 +56,7 @@ func formatAddress(addr string) string {
 
 func main() {
 	noUpdate := flag.Bool("nu", false, "Disable auto-updates")
+	verbose = flag.Bool("v", false, "Enable verbose logging")
 	flag.Parse()
 
 	loadServers()
@@ -260,39 +262,75 @@ func startProxy(target, port string, statusLabel *widget.Label, btn *widget.Butt
 	btn.SetText("Stop Proxy")
 }
 func runProxyServer(ctx context.Context, target, listen string, statusLabel *widget.Label) {
+	// Verbose helper function
+	logV := func(format string, a ...interface{}) {
+		if *verbose {
+			fmt.Printf("[DEBUG] "+format+"\n", a...)
+		}
+	}
+
 	ln, err := net.Listen("tcp", ":"+listen)
 	if err != nil {
 		statusLabel.SetText("Listen Err")
 		return
 	}
+	logV("TCP listener started on :%s, target: %s", listen, target)
+
+	targetHost := strings.Split(target, ":")[0]
+	udpTarget, _ := net.ResolveUDPAddr("udp", targetHost+":25563")
+	udpListen, _ := net.ResolveUDPAddr("udp", ":25563")
+	udpConn, err := net.ListenUDP("udp", udpListen)
+
+	if err == nil {
+		logV("UDP transparent tunnel started on :25563 -> %s:25563", targetHost)
+	}
+
 	go func() {
 		<-ctx.Done()
 		ln.Close()
+		if err == nil {
+			udpConn.Close()
+		}
+		logV("Proxy shut down.")
 	}()
+
 	statusLabel.SetText("Proxy Running")
+
+	if err == nil {
+		go func() {
+			buf := make([]byte, 4096)
+			for {
+				n, _, err := udpConn.ReadFromUDP(buf)
+				if err != nil { return }
+
+				logV("UDP Packet: %d bytes forwarded", n)
+				udpConn.WriteToUDP(buf[:n], udpTarget)
+			}
+		}()
+	}
 
 	for {
 		c, err := ln.Accept()
-		if err != nil {
-			return
-		}
+		if err != nil { return }
 
 		go func(conn net.Conn) {
+			logV("New TCP connection from %s", conn.RemoteAddr())
 			defer conn.Close()
 			p, err := net.Dial("tcp", target)
 			if err != nil {
+				logV("Failed to dial target: %v", err)
 				return
 			}
 			defer p.Close()
 
-			// 1. Handshake
 			p.Write([]byte{0x42, 0x42})
 			var pub rsa.PublicKey
 			if err := gob.NewDecoder(p).Decode(&pub); err != nil {
+				logV("Handshake failed: %v", err)
 				return
 			}
+			logV("Handshake success with %s", target)
 
-			// 2. Encryption Setup
 			iv := make([]byte, 16)
 			secret := make([]byte, 32)
 			rand.Read(iv)
@@ -302,29 +340,16 @@ func runProxyServer(ctx context.Context, target, listen string, statusLabel *wid
 			enc, _ := rsa.EncryptOAEP(sha256.New(), rand.Reader, &pub, payload, nil)
 			p.Write(enc)
 
-			// 3. Initialize Ciphers
 			block, _ := aes.NewCipher(secret)
-			// Encrypt traffic going TO the server
 			encrypter := &cipher.StreamWriter{S: cipher.NewCTR(block, iv), W: p}
-			// Decrypt traffic coming FROM the server
 			decrypter := &cipher.StreamReader{S: cipher.NewCTR(block, iv), R: p}
 
-			// 4. Asynchronous Tunneling
-			done := make(chan struct{})
-
-			// Client -> Server
-			go func() {
-				io.Copy(encrypter, conn)
-				done <- struct{}{}
-			}()
-
-			// Server -> Client
-			go func() {
-				io.Copy(conn, decrypter)
-				done <- struct{}{}
-			}()
-
-			<-done // Wait for either side to close the tunnel
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() { defer wg.Done(); io.Copy(encrypter, conn) }()
+			go func() { defer wg.Done(); io.Copy(conn, decrypter) }()
+			wg.Wait()
+			logV("TCP connection %s closed", conn.RemoteAddr())
 		}(c)
 	}
 }

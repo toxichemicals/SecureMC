@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -15,7 +14,7 @@ import (
 	"io"
 	"net"
 	"os"
-	"time"
+	"sync"
 )
 
 var (
@@ -37,14 +36,8 @@ func main() {
 
 	if *reset {
 		if _, err := os.Stat(keyFile); err == nil {
-			err := os.Remove(keyFile)
-			if err != nil {
-				fmt.Printf("Error deleting key: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Println("Server key deleted. Fingerprint reset.")
-		} else {
-			fmt.Println("No server key found to reset.")
+			os.Remove(keyFile)
+			fmt.Println("Server key deleted.")
 		}
 		os.Exit(0)
 	}
@@ -59,10 +52,6 @@ func main() {
 		os.WriteFile(keyFile, pem.EncodeToMemory(pemBlock), 0600)
 	} else {
 		block, _ := pem.Decode(keyData)
-		if block == nil {
-			fmt.Println("Error: Failed to decode server.key. File may be corrupted. Use --reset to generate a new one.")
-			os.Exit(1)
-		}
 		priv, _ = x509.ParsePKCS1PrivateKey(block.Bytes)
 	}
 
@@ -75,7 +64,6 @@ func main() {
 		return
 	}
 
-	logVerbose("Server listening on port %s", *port)
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -87,44 +75,40 @@ func main() {
 
 func handleConnection(c net.Conn, priv *rsa.PrivateKey) {
 	defer c.Close()
-	c.SetReadDeadline(time.Now().Add(5 * time.Second))
-	reader := bufio.NewReader(c)
 
-	magic, err := reader.Peek(2)
-	if err != nil || magic[0] != 0x42 || magic[1] != 0x42 {
-		logVerbose("Vanilla client detected from %s, forwarding.", c.RemoteAddr())
+	buf := make([]byte, 2)
+	n, err := c.Read(buf)
+	if err != nil || n < 2 || buf[0] != 0x42 || buf[1] != 0x42 {
 		target, err := net.Dial("tcp", *relay)
 		if err != nil {
 			return
 		}
 		defer target.Close()
 
-		go io.Copy(target, reader)
-		io.Copy(c, target)
+		if n > 0 {
+			target.Write(buf[:n])
+		}
+		proxyStreams(c, target)
 		return
 	}
-	reader.Discard(2)
 
-	logVerbose("Secure client detected from %s, initiating handshake.", c.RemoteAddr())
+	logVerbose("Secure client detected. Initiating handshake.")
 	enc := gob.NewEncoder(c)
 	enc.Encode(priv.PublicKey)
 
 	encryptedData := make([]byte, 256)
-	n, err := c.Read(encryptedData)
+	n, err = c.Read(encryptedData)
 	if err != nil {
 		return
 	}
 
 	decrypted, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, priv, encryptedData[:n], nil)
 	if err != nil || len(decrypted) < 48 {
-		logVerbose("RSA decryption failed: %v", err)
 		return
 	}
 
 	iv := decrypted[:16]
 	secret := decrypted[16:48]
-
-	logVerbose("Encryption verified. Tunneling.")
 	block, _ := aes.NewCipher(secret)
 
 	streamReader := &cipher.StreamReader{S: cipher.NewCTR(block, iv), R: c}
@@ -136,16 +120,27 @@ func handleConnection(c net.Conn, priv *rsa.PrivateKey) {
 	}
 	defer target.Close()
 
-	// Use two goroutines to prevent blocking the main handler
-	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
+		defer wg.Done()
 		io.Copy(target, streamReader)
-		done <- struct{}{}
 	}()
 	go func() {
+		defer wg.Done()
 		io.Copy(streamWriter, target)
-		done <- struct{}{}
 	}()
+	wg.Wait()
+}
 
-	<-done // Wait for either side to close
+func proxyStreams(c1, c2 net.Conn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	pipe := func(dst, src net.Conn) {
+		defer wg.Done()
+		io.Copy(dst, src)
+	}
+	go pipe(c2, c1)
+	go pipe(c1, c2)
+	wg.Wait()
 }
