@@ -169,28 +169,54 @@ start "" "%~1"`
 	os.WriteFile("update.bat", []byte(batch), 0755)
 }
 func checkForUpdates(w fyne.Window) {
+	logV := func(format string, a ...interface{}) {
+		if *verbose { fmt.Printf("[DEBUG] [Update] "+format+"\n", a...) }
+	}
+
+	logV("Checking for updates at https://raw.githubusercontent.com/toxichemicals/SecureMC/main/latver.txt")
 	resp, err := http.Get("https://raw.githubusercontent.com/toxichemicals/SecureMC/main/latver.txt")
-	if err != nil { return }
+	if err != nil {
+		logV("Update check failed: %v", err)
+		return
+	}
 	defer resp.Body.Close()
+
 	data, _ := io.ReadAll(resp.Body)
 	lines := strings.Split(string(data), "\n")
-	if len(lines) == 0 || strings.TrimSpace(lines[0]) == currentVersion { return }
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == currentVersion {
+		logV("Version %s is up to date.", currentVersion)
+		return
+	}
+
+	logV("New version found: %s", strings.TrimSpace(lines[0]))
 	for _, line := range lines[1:] {
 		if strings.HasPrefix(line, runtime.GOOS+":") {
 			path := strings.TrimSpace(strings.Split(line, ": ")[1])
 			progress := widget.NewProgressBarWithData(updateBinding)
-			w.SetContent(container.NewVBox(widget.NewLabel("Updating..."), progress))
+			w.SetContent(container.NewVBox(widget.NewLabel("Updating to "+lines[0]+"..."), progress))
 			executeUpgrade(path)
 		}
 	}
 }
+
 func executeUpgrade(url string) {
-	resp, _ := http.Get("https://github.com/toxichemicals/SecureMC/raw/main/" + url)
+	logV := func(format string, a ...interface{}) {
+		if *verbose { fmt.Printf("[DEBUG] [Upgrade] "+format+"\n", a...) }
+	}
+
+	logV("Downloading upgrade from: %s", url)
+	resp, err := http.Get("https://github.com/toxichemicals/SecureMC/raw/main/" + url)
+	if err != nil {
+		logV("Download failed: %v", err)
+		return
+	}
 	defer resp.Body.Close()
+
 	total, _ := strconv.ParseFloat(resp.Header.Get("Content-Length"), 64)
 	exePath, _ := os.Executable()
 	newPath := exePath + ".new"
 	out, _ := os.Create(newPath)
+
 	buf := make([]byte, 32*1024)
 	var downloaded float64
 	for {
@@ -201,8 +227,15 @@ func executeUpgrade(url string) {
 		}
 		if err == io.EOF { break }
 	}
-	out.Close(); os.Chmod(newPath, 0755)
-	if runtime.GOOS == "windows" { exec.Command("cmd", "/c", "update.bat", exePath, newPath).Start() } else { os.Rename(newPath, exePath); exec.Command(exePath).Start() }
+	out.Close()
+	os.Chmod(newPath, 0755)
+
+	logV("Download complete. Replacing executable...")
+	if runtime.GOOS == "windows" {
+		exec.Command("cmd", "/c", "update.bat", exePath, newPath).Start()
+	} else {
+		os.Rename(newPath, exePath); exec.Command(exePath).Start()
+	}
 	os.Exit(0)
 }
 func verifyAndStart(w fyne.Window, target, port string, statusLabel *widget.Label, btn *widget.Button) {
