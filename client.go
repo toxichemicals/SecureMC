@@ -35,7 +35,7 @@ import (
 	"sync"
 )
 
-const currentVersion = "1.4.1"
+const currentVersion = "1.4.2"
 
 type SavedServer struct {
 	Addr string `json:"addr"`
@@ -169,8 +169,11 @@ start "" "%~1"`
 	os.WriteFile("update.bat", []byte(batch), 0755)
 }
 func checkForUpdates(w fyne.Window) {
+	// Verbose helper function
 	logV := func(format string, a ...interface{}) {
-		if *verbose { fmt.Printf("[DEBUG] [Update] "+format+"\n", a...) }
+		if verbose != nil && *verbose {
+			fmt.Printf("[DEBUG] [PROXY] "+format+"\n", a...)
+		}
 	}
 
 	logV("Checking for updates at https://raw.githubusercontent.com/toxichemicals/SecureMC/main/latver.txt")
@@ -295,53 +298,70 @@ func startProxy(target, port string, statusLabel *widget.Label, btn *widget.Butt
 	btn.SetText("Stop Proxy")
 }
 func runProxyServer(ctx context.Context, target, listen string, statusLabel *widget.Label) {
-	// Verbose helper function
 	logV := func(format string, a ...interface{}) {
-		if *verbose {
-			fmt.Printf("[DEBUG] "+format+"\n", a...)
+		if verbose != nil && *verbose {
+			fmt.Printf("[DEBUG] [PROXY] "+format+"\n", a...)
 		}
 	}
 
-	ln, err := net.Listen("tcp", ":"+listen)
-	if err != nil {
-		statusLabel.SetText("Listen Err")
-		return
-	}
-	logV("TCP listener started on :%s, target: %s", listen, target)
-
+	// 1. Initialize UDP IMMEDIATELY
 	targetHost := strings.Split(target, ":")[0]
 	udpTarget, _ := net.ResolveUDPAddr("udp", targetHost+":25563")
 	udpListen, _ := net.ResolveUDPAddr("udp", ":25563")
 	udpConn, err := net.ListenUDP("udp", udpListen)
 
-	if err == nil {
-		logV("UDP transparent tunnel started on :25563 -> %s:25563", targetHost)
+	if err != nil {
+		logV("CRITICAL: UDP Bind Failed: %v", err)
+	} else {
+		logV("UDP bidirectional tunnel active on :25563")
+		sessions := make(map[string]*net.UDPAddr)
+		var mu sync.Mutex
+
+		// Forwarding: Client -> Server
+		go func() {
+			buf := make([]byte, 4096)
+			for {
+				n, srcAddr, readErr := udpConn.ReadFromUDP(buf)
+				if readErr != nil { return }
+				mu.Lock()
+				sessions[srcAddr.String()] = srcAddr
+				mu.Unlock()
+				logV("UDP Forwarding %d bytes from %v", n, srcAddr)
+				udpConn.WriteToUDP(buf[:n], udpTarget)
+			}
+		}()
+
+		// Forwarding: Server -> Client
+		go func() {
+			buf := make([]byte, 4096)
+			for {
+				n, _, readErr := udpConn.ReadFromUDP(buf)
+				if readErr != nil { return }
+				mu.Lock()
+				for _, clientAddr := range sessions {
+					udpConn.WriteToUDP(buf[:n], clientAddr)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+
+	ln, err := net.Listen("tcp", ":"+listen)
+	if err != nil {
+		logV("TCP Listen Error: %v", err)
+		return
 	}
 
 	go func() {
 		<-ctx.Done()
 		ln.Close()
-		if err == nil {
-			udpConn.Close()
-		}
-		logV("Proxy shut down.")
+		if udpConn != nil { udpConn.Close() }
 	}()
 
 	statusLabel.SetText("Proxy Running")
+	logV("TCP tunnel now accepting connections.")
 
-	if err == nil {
-		go func() {
-			buf := make([]byte, 4096)
-			for {
-				n, _, err := udpConn.ReadFromUDP(buf)
-				if err != nil { return }
-
-				logV("UDP Packet: %d bytes forwarded", n)
-				udpConn.WriteToUDP(buf[:n], udpTarget)
-			}
-		}()
-	}
-
+	// 3. TCP Loop
 	for {
 		c, err := ln.Accept()
 		if err != nil { return }
@@ -356,6 +376,7 @@ func runProxyServer(ctx context.Context, target, listen string, statusLabel *wid
 			}
 			defer p.Close()
 
+			// Encryption Handshake
 			p.Write([]byte{0x42, 0x42})
 			var pub rsa.PublicKey
 			if err := gob.NewDecoder(p).Decode(&pub); err != nil {
@@ -364,8 +385,7 @@ func runProxyServer(ctx context.Context, target, listen string, statusLabel *wid
 			}
 			logV("Handshake success with %s", target)
 
-			iv := make([]byte, 16)
-			secret := make([]byte, 32)
+			iv, secret := make([]byte, 16), make([]byte, 32)
 			rand.Read(iv)
 			rand.Read(secret)
 
