@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/gob"
 	"encoding/json"
 	"flag"
@@ -30,9 +32,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
 )
 
-const currentVersion = "1.3.1"
+const currentVersion = "1.4.0"
 
 type SavedServer struct {
 	Addr string `json:"addr"`
@@ -258,20 +261,70 @@ func startProxy(target, port string, statusLabel *widget.Label, btn *widget.Butt
 }
 func runProxyServer(ctx context.Context, target, listen string, statusLabel *widget.Label) {
 	ln, err := net.Listen("tcp", ":"+listen)
-	if err != nil { statusLabel.SetText("Listen Err"); return }
-	go func() { <-ctx.Done(); ln.Close() }()
+	if err != nil {
+		statusLabel.SetText("Listen Err")
+		return
+	}
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
 	statusLabel.SetText("Proxy Running")
+
 	for {
 		c, err := ln.Accept()
-		if err != nil { return }
+		if err != nil {
+			return
+		}
+
 		go func(conn net.Conn) {
-			defer conn.Close(); p, err := net.Dial("tcp", target)
-			if err != nil { return }
-			defer p.Close(); p.Write([]byte{0x42, 0x42})
-			var pub rsa.PublicKey; gob.NewDecoder(p).Decode(&pub)
-			secret := make([]byte, 32); rand.Read(secret)
-			enc, _ := rsa.EncryptOAEP(sha256.New(), rand.Reader, &pub, secret, nil)
-			p.Write(enc); go io.Copy(p, conn); io.Copy(conn, p)
+			defer conn.Close()
+			p, err := net.Dial("tcp", target)
+			if err != nil {
+				return
+			}
+			defer p.Close()
+
+			// 1. Handshake
+			p.Write([]byte{0x42, 0x42})
+			var pub rsa.PublicKey
+			if err := gob.NewDecoder(p).Decode(&pub); err != nil {
+				return
+			}
+
+			// 2. Encryption Setup
+			iv := make([]byte, 16)
+			secret := make([]byte, 32)
+			rand.Read(iv)
+			rand.Read(secret)
+
+			payload := append(iv, secret...)
+			enc, _ := rsa.EncryptOAEP(sha256.New(), rand.Reader, &pub, payload, nil)
+			p.Write(enc)
+
+			// 3. Initialize Ciphers
+			block, _ := aes.NewCipher(secret)
+			// Encrypt traffic going TO the server
+			encrypter := &cipher.StreamWriter{S: cipher.NewCTR(block, iv), W: p}
+			// Decrypt traffic coming FROM the server
+			decrypter := &cipher.StreamReader{S: cipher.NewCTR(block, iv), R: p}
+
+			// 4. Asynchronous Tunneling
+			done := make(chan struct{})
+
+			// Client -> Server
+			go func() {
+				io.Copy(encrypter, conn)
+				done <- struct{}{}
+			}()
+
+			// Server -> Client
+			go func() {
+				io.Copy(conn, decrypter)
+				done <- struct{}{}
+			}()
+
+			<-done // Wait for either side to close the tunnel
 		}(c)
 	}
 }
