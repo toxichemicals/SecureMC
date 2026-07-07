@@ -31,7 +31,7 @@ Run the server-side component with the following flags:
    - `make server`: Builds the server component only.
    - `make client`: Builds the client component only.
 
-*Note: Client compilations may take significant time during the first build due to the GUI dependency graph.*
+*Note: Client compilations may take significant time during the first build due to the GUI dependency called Fyne.*
 
 ## How it Works
 
