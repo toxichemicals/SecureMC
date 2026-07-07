@@ -3,22 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/aes"
-	"crypto/cipher"
 	"encoding/gob"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/app"
-	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/data/binding"
-	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/driver/desktop"
-	"fyne.io/fyne/v2/widget"
 	"image"
 	"image/color"
 	"image/draw"
@@ -31,11 +24,19 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
 	"sync"
+	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/data/binding"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/widget"
 )
 
-const currentVersion = "1.4.2"
+const currentVersion = "1.5.0"
 
 type SavedServer struct {
 	Addr string `json:"addr"`
@@ -43,14 +44,18 @@ type SavedServer struct {
 }
 
 var (
-	currentCancel context.CancelFunc
-	updateBinding = binding.NewFloat()
-	savedList     []SavedServer
-	verbose				*bool
+	activeProxies  = make(map[string]context.CancelFunc) // RAM Storage: maps LocalPort -> CancelFunc
+	proxyMu        sync.Mutex
+	concurrentMode bool
+	updateBinding  = binding.NewFloat()
+	savedList      []SavedServer
+	verbose        *bool
 )
 
 func formatAddress(addr string) string {
-	if !strings.Contains(addr, ":") { return addr + ":25565" }
+	if !strings.Contains(addr, ":") {
+		return addr + ":25565"
+	}
 	return addr
 }
 
@@ -86,6 +91,26 @@ func main() {
 	statusLabel := widget.NewLabel("Ready")
 	btn := widget.NewButton("Start Proxy", nil)
 
+	// Dynamic Button UI Updates based on RAM storage state
+	refreshButtonText := func() {
+		proxyMu.Lock()
+		_, running := activeProxies[localEntry.Text]
+		proxyMu.Unlock()
+		if running {
+			btn.SetText("Stop Proxy")
+		} else {
+			btn.SetText("Start Proxy")
+		}
+	}
+
+	localEntry.OnChanged = func(s string) {
+		refreshButtonText()
+	}
+
+	concurrentCheck := widget.NewCheck("Concurrent Mode", func(checked bool) {
+		concurrentMode = checked
+	})
+
 	list := widget.NewList(
 		func() int { return len(savedList) },
 		func() fyne.CanvasObject {
@@ -108,28 +133,63 @@ func main() {
 	list.OnSelected = func(id widget.ListItemID) {
 		targetEntry.SetText(savedList[id].Addr)
 		localEntry.SetText(savedList[id].Port)
+		refreshButtonText()
 	}
 
 	btn.OnTapped = func() {
-		if btn.Text == "Start Proxy" {
-			addr := formatAddress(targetEntry.Text)
-			addServer(addr, localEntry.Text)
-			w.Content().Refresh()
-			verifyAndStart(w, addr, localEntry.Text, statusLabel, btn)
-		} else if currentCancel != nil {
-			currentCancel()
+		port := strings.TrimSpace(localEntry.Text)
+		if port == "" {
+			dialog.ShowError(fmt.Errorf("Please specify a local port"), w)
+			return
+		}
+		addr := formatAddress(targetEntry.Text)
+
+		proxyMu.Lock()
+		_, running := activeProxies[port]
+		activeCount := len(activeProxies)
+		proxyMu.Unlock()
+
+		if running {
+			// Stop target specific proxy connection
+			proxyMu.Lock()
+			if cancel, ok := activeProxies[port]; ok {
+				cancel()
+				delete(activeProxies, port)
+			}
+			proxyMu.Unlock()
 			btn.SetText("Start Proxy")
-			statusLabel.SetText("Stopped")
+			statusLabel.SetText("Stopped proxy on port " + port)
+		} else {
+			// Strict Guard Rails for Client Allocation
+			if !concurrentMode && activeCount > 0 {
+				dialog.ShowError(fmt.Errorf("Concurrent mode is disabled! Stop running clients first."), w)
+				return
+			}
+
+			proxyMu.Lock()
+			_, portCollided := activeProxies[port]
+			proxyMu.Unlock()
+			if portCollided {
+				dialog.ShowError(fmt.Errorf("Port %s is already in use by another SecureMC client session!", port), w)
+				return
+			}
+
+			addServer(addr, port)
+			w.Content().Refresh()
+			verifyAndStart(w, addr, port, statusLabel, btn, refreshButtonText)
 		}
 	}
 
 	instrBtn := widget.NewButton("Instructions", func() {
-		dialog.ShowInformation("How to use", "1. Type server address\n2. Type local port\n3. Start Proxy\n4. Connect to localhost:[port]", w)
+		dialog.ShowInformation("How to use", "1. Type server address\n2. Type local port\n3. Start Proxy\n4. Connect to localhost:[port]\n5. For concurrent mode, do the same steps but start the proxy a second time with a different local port.", w)
 	})
 
 	resetBtn := widget.NewButton("Reset Host Fingerprints", func() {
 		dialog.ShowConfirm("Reset", "Clear all known fingerprints?", func(ok bool) {
-			if ok { os.Remove("known_hosts"); statusLabel.SetText("Cleared") }
+			if ok {
+				os.Remove("known_hosts")
+				statusLabel.SetText("Cleared")
+			}
 		}, w)
 	})
 
@@ -137,6 +197,7 @@ func main() {
 		container.NewVBox(
 			widget.NewLabel("Server Address:"), targetEntry,
 			widget.NewLabel("Local Port:"), localEntry,
+			concurrentCheck,
 			container.NewPadded(btn),
 			container.NewPadded(instrBtn),
 			container.NewPadded(resetBtn),
@@ -148,17 +209,30 @@ func main() {
 
 	w.SetContent(content)
 	if !*noUpdate {
-		if runtime.GOOS == "windows" { ensureBatchFile() }
+		if runtime.GOOS == "windows" {
+			ensureBatchFile()
+		}
 		go checkForUpdates(w)
 	}
 	w.ShowAndRun()
 }
 
-func loadServers() { data, _ := os.ReadFile("saved_servers.json"); json.Unmarshal(data, &savedList) }
-func saveServers() { data, _ := json.Marshal(savedList); os.WriteFile("saved_servers.json", data, 0644) }
+func loadServers() {
+	data, _ := os.ReadFile("saved_servers.json")
+	json.Unmarshal(data, &savedList)
+}
+func saveServers() {
+	data, _ := json.Marshal(savedList)
+	os.WriteFile("saved_servers.json", data, 0644)
+}
 func addServer(addr, port string) {
-	for _, s := range savedList { if s.Addr == addr && s.Port == port { return } }
-	savedList = append(savedList, SavedServer{Addr: addr, Port: port}); saveServers()
+	for _, s := range savedList {
+		if s.Addr == addr && s.Port == port {
+			return
+		}
+	}
+	savedList = append(savedList, SavedServer{Addr: addr, Port: port})
+	saveServers()
 }
 func ensureBatchFile() {
 	batch := `@echo off
@@ -168,8 +242,8 @@ move "%~2" "%~1"
 start "" "%~1"`
 	os.WriteFile("update.bat", []byte(batch), 0755)
 }
+
 func checkForUpdates(w fyne.Window) {
-	// Verbose helper function
 	logV := func(format string, a ...interface{}) {
 		if verbose != nil && *verbose {
 			fmt.Printf("[DEBUG] [PROXY] "+format+"\n", a...)
@@ -204,7 +278,9 @@ func checkForUpdates(w fyne.Window) {
 
 func executeUpgrade(url string) {
 	logV := func(format string, a ...interface{}) {
-		if *verbose { fmt.Printf("[DEBUG] [Upgrade] "+format+"\n", a...) }
+		if *verbose {
+			fmt.Printf("[DEBUG] [Upgrade] "+format+"\n", a...)
+		}
 	}
 
 	logV("Downloading upgrade from: %s", url)
@@ -225,10 +301,13 @@ func executeUpgrade(url string) {
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
-			out.Write(buf[:n]); downloaded += float64(n)
+			out.Write(buf[:n])
+			downloaded += float64(n)
 			updateBinding.Set(downloaded / total)
 		}
-		if err == io.EOF { break }
+		if err == io.EOF {
+			break
+		}
 	}
 	out.Close()
 	os.Chmod(newPath, 0755)
@@ -237,34 +316,45 @@ func executeUpgrade(url string) {
 	if runtime.GOOS == "windows" {
 		exec.Command("cmd", "/c", "update.bat", exePath, newPath).Start()
 	} else {
-		os.Rename(newPath, exePath); exec.Command(exePath).Start()
+		os.Rename(newPath, exePath)
+		exec.Command(exePath).Start()
 	}
 	os.Exit(0)
 }
-func verifyAndStart(w fyne.Window, target, port string, statusLabel *widget.Label, btn *widget.Button) {
+
+func verifyAndStart(w fyne.Window, target, port string, statusLabel *widget.Label, btn *widget.Button, refreshBtn func()) {
 	normalizedTarget := formatAddress(target)
 	conn, err := net.DialTimeout("tcp", normalizedTarget, 3*time.Second)
-	if err != nil { statusLabel.SetText("Failed"); return }
-	defer conn.Close(); conn.Write([]byte{0x42, 0x42})
+	if err != nil {
+		statusLabel.SetText("Failed")
+		return
+	}
+	defer conn.Close()
+	conn.Write([]byte{0x42, 0x42})
 
 	var pub rsa.PublicKey
-	if err := gob.NewDecoder(conn).Decode(&pub); err != nil { statusLabel.SetText("Handshake Fail"); return }
+	if err := gob.NewDecoder(conn).Decode(&pub); err != nil {
+		statusLabel.SetText("Handshake Fail")
+		return
+	}
 
 	fp := fmt.Sprintf("%x", sha256.Sum256(pub.N.Bytes()))
 
-	// Read and parse known_hosts strictly
 	data, _ := os.ReadFile("known_hosts")
 	lines := strings.Split(string(data), "\n")
 
 	found := false
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if line == "" { continue }
+		if line == "" {
+			continue
+		}
 
 		parts := strings.Split(line, ":")
-		if len(parts) < 2 { continue }
+		if len(parts) < 2 {
+			continue
+		}
 
-		// Reconstruct the key to match exactly
 		hostKey := strings.Join(parts[:len(parts)-1], ":")
 		storedFp := parts[len(parts)-1]
 
@@ -280,31 +370,37 @@ func verifyAndStart(w fyne.Window, target, port string, statusLabel *widget.Labe
 	}
 
 	if found {
-		startProxy(normalizedTarget, port, statusLabel, btn)
+		startProxy(normalizedTarget, port, statusLabel, btn, refreshBtn)
 	} else {
 		dialog.ShowConfirm("Identity", "Trust new fingerprint?\n"+fp, func(ok bool) {
 			if ok {
 				f, _ := os.OpenFile("known_hosts", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-				f.WriteString(normalizedTarget + ":" + fp + "\n"); f.Close(); startProxy(normalizedTarget, port, statusLabel, btn)
+				f.WriteString(normalizedTarget + ":" + fp + "\n")
+				f.Close()
+				startProxy(normalizedTarget, port, statusLabel, btn, refreshBtn)
 			}
 		}, w)
 	}
 }
 
-func startProxy(target, port string, statusLabel *widget.Label, btn *widget.Button) {
+func startProxy(target, port string, statusLabel *widget.Label, btn *widget.Button, refreshBtn func()) {
 	ctx, cancel := context.WithCancel(context.Background())
-	currentCancel = cancel
-	go runProxyServer(ctx, target, port, statusLabel)
-	btn.SetText("Stop Proxy")
+
+	proxyMu.Lock()
+	activeProxies[port] = cancel
+	proxyMu.Unlock()
+
+	go runProxyServer(ctx, target, port, statusLabel, refreshBtn)
+	refreshBtn()
 }
-func runProxyServer(ctx context.Context, target, listen string, statusLabel *widget.Label) {
+
+func runProxyServer(ctx context.Context, target, listen string, statusLabel *widget.Label, refreshBtn func()) {
 	logV := func(format string, a ...interface{}) {
 		if verbose != nil && *verbose {
 			fmt.Printf("[DEBUG] [PROXY] "+format+"\n", a...)
 		}
 	}
 
-	// 1. Initialize UDP IMMEDIATELY
 	targetHost := strings.Split(target, ":")[0]
 	udpTarget, _ := net.ResolveUDPAddr("udp", targetHost+":25563")
 	udpListen, _ := net.ResolveUDPAddr("udp", ":25563")
@@ -317,12 +413,13 @@ func runProxyServer(ctx context.Context, target, listen string, statusLabel *wid
 		sessions := make(map[string]*net.UDPAddr)
 		var mu sync.Mutex
 
-		// Forwarding: Client -> Server
 		go func() {
 			buf := make([]byte, 4096)
 			for {
 				n, srcAddr, readErr := udpConn.ReadFromUDP(buf)
-				if readErr != nil { return }
+				if readErr != nil {
+					return
+				}
 				mu.Lock()
 				sessions[srcAddr.String()] = srcAddr
 				mu.Unlock()
@@ -331,12 +428,13 @@ func runProxyServer(ctx context.Context, target, listen string, statusLabel *wid
 			}
 		}()
 
-		// Forwarding: Server -> Client
 		go func() {
 			buf := make([]byte, 4096)
 			for {
 				n, _, readErr := udpConn.ReadFromUDP(buf)
-				if readErr != nil { return }
+				if readErr != nil {
+					return
+				}
 				mu.Lock()
 				for _, clientAddr := range sessions {
 					udpConn.WriteToUDP(buf[:n], clientAddr)
@@ -349,22 +447,37 @@ func runProxyServer(ctx context.Context, target, listen string, statusLabel *wid
 	ln, err := net.Listen("tcp", ":"+listen)
 	if err != nil {
 		logV("TCP Listen Error: %v", err)
+		proxyMu.Lock()
+		delete(activeProxies, listen)
+		proxyMu.Unlock()
+		refreshBtn()
+		statusLabel.SetText("Bind Error")
 		return
 	}
 
 	go func() {
 		<-ctx.Done()
 		ln.Close()
-		if udpConn != nil { udpConn.Close() }
+		if udpConn != nil {
+			udpConn.Close()
+		}
 	}()
 
-	statusLabel.SetText("Proxy Running")
+	statusLabel.SetText("Proxy Running (" + listen + ")")
 	logV("TCP tunnel now accepting connections.")
 
-	// 3. TCP Loop
+	defer func() {
+		proxyMu.Lock()
+		delete(activeProxies, listen)
+		proxyMu.Unlock()
+		refreshBtn()
+	}()
+
 	for {
 		c, err := ln.Accept()
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 
 		go func(conn net.Conn) {
 			logV("New TCP connection from %s", conn.RemoteAddr())
@@ -376,7 +489,6 @@ func runProxyServer(ctx context.Context, target, listen string, statusLabel *wid
 			}
 			defer p.Close()
 
-			// Encryption Handshake
 			p.Write([]byte{0x42, 0x42})
 			var pub rsa.PublicKey
 			if err := gob.NewDecoder(p).Decode(&pub); err != nil {
