@@ -22,6 +22,7 @@ var (
 	relay   = flag.String("r", "127.0.0.1:25565", "Minecraft server relay")
 	verbose = flag.Bool("v", false, "Enable verbose logging")
 	reset   = flag.Bool("reset", false, "Delete existing server key and exit")
+	logIP   = flag.Bool("ip", false, "Print IPs when connecting and append to ip.txt")
 )
 
 func logVerbose(format string, a ...interface{}) {
@@ -75,6 +76,26 @@ func main() {
 
 func handleConnection(c net.Conn, priv *rsa.PrivateKey) {
 	defer c.Close()
+
+	// If the -ip flag is enabled, log the connecting IP
+	if *logIP {
+		host, _, err := net.SplitHostPort(c.RemoteAddr().String())
+		if err != nil {
+			// Fallback if SplitHostPort fails for some reason
+			host = c.RemoteAddr().String()
+		}
+
+		fmt.Printf("Connection from IP: %s\n", host)
+
+		// Append the IP to ip.txt
+		f, err := os.OpenFile("ip.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			fmt.Printf("Error opening ip.txt: %v\n", err)
+		} else {
+			f.WriteString(host + "\n")
+			f.Close()
+		}
+	}
 
 	buf := make([]byte, 2)
 	n, err := c.Read(buf)
